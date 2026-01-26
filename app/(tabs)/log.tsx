@@ -1,0 +1,359 @@
+import { useState, useEffect } from "react";
+import { View, Text, TextInput, TouchableOpacity, ScrollView, ActivityIndicator } from "react-native";
+import { ScreenContainer } from "@/components/screen-container";
+import { useRouter } from "expo-router";
+import { saveJournalEntry, getJournalEntries, getJournalEntryByDate, getUserProfile } from "@/lib/storage";
+import { JournalEntry, UserProfile, DailyEnergy } from "@/types";
+import { calculateDailyEnergy } from "@/lib/energy-engine";
+import { generateJournalPrompts, getFeaturedPrompt } from "@/lib/journal-prompts";
+import {
+  requestAudioPermissions,
+  startRecording,
+  stopRecording,
+  getVoiceNotesForDate,
+  playVoiceNote,
+  deleteVoiceNote,
+  formatDuration,
+  VoiceNote,
+} from "@/lib/voice-notes";
+import { Audio } from "expo-av";
+import * as Haptics from "expo-haptics";
+import { VoiceNoteAnalysis } from "@/components/voice-note-analysis";
+import { VoiceNotePlayer } from "@/components/voice-note-player";
+import { OutcomeLogger } from "@/components/outcome-logger";
+import { calculateUnifiedEnergy } from "@/lib/unified-energy-engine";
+
+type Mood = "happy" | "neutral" | "sad";
+
+export default function LogScreen() {
+  const router = useRouter();
+  const [loading, setLoading] = useState(true);
+  const [entries, setEntries] = useState<JournalEntry[]>([]);
+  const [todayEntry, setTodayEntry] = useState<JournalEntry | null>(null);
+  const [notes, setNotes] = useState("");
+  const [mood, setMood] = useState<Mood | undefined>(undefined);
+  const [menstrualCycle, setMenstrualCycle] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
+  const [recording, setRecording] = useState<Audio.Recording | null>(null);
+  const [voiceNotes, setVoiceNotes] = useState<VoiceNote[]>([]);
+  const [playingSound, setPlayingSound] = useState<Audio.Sound | null>(null);
+  const [profile, setProfile] = useState<UserProfile | null>(null);
+  const [dailyEnergy, setDailyEnergy] = useState<DailyEnergy | null>(null);
+  const [featuredPrompt, setFeaturedPrompt] = useState<string>("");
+
+  useEffect(() => {
+    loadData();
+    loadVoiceNotes();
+  }, []);
+
+  const loadVoiceNotes = async () => {
+    const today = new Date().toISOString().split("T")[0];
+    const notes = await getVoiceNotesForDate(today);
+    setVoiceNotes(notes);
+  };
+
+  const loadData = async () => {
+    const userProfile = await getUserProfile();
+    const allEntries = await getJournalEntries();
+    const today = new Date().toISOString().split("T")[0];
+    const existing = await getJournalEntryByDate(today);
+
+    setEntries(allEntries.reverse()); // Most recent first
+    setTodayEntry(existing);
+    
+    if (existing) {
+      setNotes(existing.notes);
+      setMood(existing.mood);
+      setMenstrualCycle(existing.menstrualCycle || false);
+    }
+
+    // Load energy and prompts
+    if (userProfile) {
+      setProfile(userProfile);
+      const energy = calculateDailyEnergy(userProfile, new Date());
+      setDailyEnergy(energy);
+      setFeaturedPrompt(getFeaturedPrompt(energy));
+    }
+
+    setLoading(false);
+  };
+
+  const handleSave = async () => {
+    const today = new Date().toISOString().split("T")[0];
+    
+    const entry: JournalEntry = {
+      id: todayEntry?.id || `entry_${Date.now()}`,
+      date: today,
+      notes: notes.trim(),
+      mood,
+      menstrualCycle,
+      createdAt: todayEntry?.createdAt || new Date().toISOString(),
+    };
+
+    await saveJournalEntry(entry);
+    setTodayEntry(entry);
+    
+    // Refresh entries list
+    const allEntries = await getJournalEntries();
+    setEntries(allEntries.reverse());
+    
+    // Silent save - no alert needed
+  };
+
+  if (loading) {
+    return (
+      <ScreenContainer className="items-center justify-center">
+        <ActivityIndicator size="large" color="#0A7EA4" />
+      </ScreenContainer>
+    );
+  }
+
+  return (
+    <ScreenContainer className="p-6">
+      <ScrollView contentContainerStyle={{ flexGrow: 1 }}>
+        <View className="flex-1 gap-6">
+          {/* Header */}
+          <View>
+            <Text className="text-2xl font-bold text-foreground">Personal Log</Text>
+            <Text className="text-sm text-muted mt-1">
+              Track your daily patterns and observations
+            </Text>
+          </View>
+
+          {/* Voice Recording */}
+          <View className="bg-surface rounded-2xl p-5 border border-border gap-4">
+            <Text className="text-sm font-medium text-muted">VOICE NOTE</Text>
+            
+            <TouchableOpacity
+              onPress={async () => {
+                if (isRecording) {
+                  // Stop recording
+                  if (recording) {
+                    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+                    const voiceNote = await stopRecording(recording);
+                    setRecording(null);
+                    setIsRecording(false);
+                    if (voiceNote) {
+                      await loadVoiceNotes();
+                    }
+                  }
+                } else {
+                  // Start recording
+                  const hasPermission = await requestAudioPermissions();
+                  if (hasPermission) {
+                    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+                    const rec = await startRecording();
+                    if (rec) {
+                      setRecording(rec);
+                      setIsRecording(true);
+                    }
+                  }
+                }
+              }}
+              className={`${isRecording ? "bg-error" : "bg-primary"} px-6 py-4 rounded-full active:opacity-80 flex-row items-center justify-center gap-2`}
+            >
+              <Text className="text-lg">{isRecording ? "⏸" : "🎤"}</Text>
+              <Text className="text-white font-semibold">
+                {isRecording ? "Stop Recording" : "Record Voice Note"}
+              </Text>
+            </TouchableOpacity>
+
+            {/* Voice Notes List */}
+            {voiceNotes.length > 0 && (
+              <View className="gap-2">
+                <Text className="text-xs text-muted">TODAY'S VOICE NOTES</Text>
+                {voiceNotes.map((note) => (
+                  <View key={note.id} className="gap-3">
+                    {/* Playback Controls */}
+                    <View className="flex-row items-center justify-between">
+                      <Text className="text-sm font-medium text-foreground">Voice Note</Text>
+                      <TouchableOpacity
+                        onPress={async () => {
+                          await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+                          await deleteVoiceNote(note.id);
+                          await loadVoiceNotes();
+                        }}
+                        className="bg-error/10 rounded-full px-3 py-1"
+                      >
+                        <Text className="text-xs text-error">Delete</Text>
+                      </TouchableOpacity>
+                    </View>
+                    
+                    <VoiceNotePlayer uri={note.uri} duration={note.duration} />
+                    
+                    <VoiceNoteAnalysis
+                      voiceNoteUri={note.uri}
+                      voiceNoteId={note.id}
+                      energyScore={
+                        dailyEnergy?.connection.alignment === "strong" ? 85 :
+                        dailyEnergy?.connection.alignment === "moderate" ? 65 :
+                        dailyEnergy?.connection.alignment === "challenging" ? 45 :
+                        undefined
+                      }
+                    />
+                  </View>
+                ))}
+              </View>
+            )}
+          </View>
+
+          {/* Template Selector */}
+          <TouchableOpacity
+            onPress={() => router.push("/select-template" as any)}
+            className="bg-primary/10 rounded-2xl p-5 border border-primary/30 active:opacity-70"
+          >
+            <View className="flex-row items-center justify-between">
+              <View className="flex-1">
+                <Text className="text-base font-semibold text-foreground mb-1">📋 Use a Template</Text>
+                <Text className="text-sm text-muted">Guided reflection for meetings, decisions, creative work & more</Text>
+              </View>
+              <Text className="text-2xl ml-3">→</Text>
+            </View>
+          </TouchableOpacity>
+
+          {/* Outcome Logger */}
+          {profile && dailyEnergy && (
+            <OutcomeLogger
+              energyScore={dailyEnergy.userEnergy.intensity}
+              onSaved={loadData}
+            />
+          )}
+
+          {/* Smart Prompt */}
+          {featuredPrompt && (
+            <View className="bg-primary/5 rounded-2xl p-5 border border-primary/20">
+              <View className="flex-row items-start gap-3">
+                <Text className="text-2xl">💭</Text>
+                <View className="flex-1">
+                  <Text className="text-xs font-medium text-primary mb-2">TODAY'S PROMPT</Text>
+                  <Text className="text-base text-foreground leading-relaxed">
+                    {featuredPrompt}
+                  </Text>
+                </View>
+              </View>
+            </View>
+          )}
+
+          {/* Today's Entry Form */}
+          <View className="bg-surface rounded-2xl p-5 border border-border gap-4">
+            <Text className="text-sm font-medium text-muted">
+              TODAY - {new Date().toLocaleDateString("en-US", { month: "long", day: "numeric" })}
+            </Text>
+
+            {/* Notes Input */}
+            <View className="gap-2">
+              <Text className="text-sm font-medium text-foreground">How was your day?</Text>
+              <TextInput
+                value={notes}
+                onChangeText={setNotes}
+                placeholder="Write your thoughts, observations, or reflections..."
+                placeholderTextColor="#9BA1A6"
+                multiline
+                numberOfLines={4}
+                textAlignVertical="top"
+                className="bg-background border border-border rounded-lg px-4 py-3 text-foreground min-h-[100px]"
+              />
+            </View>
+
+            {/* Mood Selector */}
+            <View className="gap-2">
+              <Text className="text-sm font-medium text-foreground">Mood</Text>
+              <View className="flex-row gap-3">
+                <TouchableOpacity
+                  onPress={() => setMood("happy")}
+                  className={`flex-1 items-center justify-center py-3 rounded-lg border ${
+                    mood === "happy" ? "bg-success/20 border-success" : "bg-background border-border"
+                  }`}
+                >
+                  <Text className="text-2xl">😊</Text>
+                  <Text className="text-xs text-muted mt-1">Happy</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  onPress={() => setMood("neutral")}
+                  className={`flex-1 items-center justify-center py-3 rounded-lg border ${
+                    mood === "neutral" ? "bg-warning/20 border-warning" : "bg-background border-border"
+                  }`}
+                >
+                  <Text className="text-2xl">😐</Text>
+                  <Text className="text-xs text-muted mt-1">Neutral</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  onPress={() => setMood("sad")}
+                  className={`flex-1 items-center justify-center py-3 rounded-lg border ${
+                    mood === "sad" ? "bg-error/20 border-error" : "bg-background border-border"
+                  }`}
+                >
+                  <Text className="text-2xl">😔</Text>
+                  <Text className="text-xs text-muted mt-1">Low</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+
+            {/* Menstrual Cycle Tracker (Optional) */}
+            <TouchableOpacity
+              onPress={() => setMenstrualCycle(!menstrualCycle)}
+              className="flex-row items-center gap-3 py-2"
+            >
+              <View className={`w-5 h-5 rounded border ${menstrualCycle ? "bg-primary border-primary" : "bg-background border-border"}`}>
+                {menstrualCycle && <Text className="text-white text-center text-xs">✓</Text>}
+              </View>
+              <Text className="text-sm text-foreground">Menstrual cycle day (optional)</Text>
+            </TouchableOpacity>
+
+            {/* Save Button */}
+            <TouchableOpacity
+              onPress={handleSave}
+              disabled={!notes.trim()}
+              className={`py-3 rounded-lg ${notes.trim() ? "bg-primary" : "bg-border"}`}
+            >
+              <Text className={`text-center font-semibold ${notes.trim() ? "text-white" : "text-muted"}`}>
+                Save Entry
+              </Text>
+            </TouchableOpacity>
+
+            {/* Privacy Note */}
+            <Text className="text-xs text-muted text-center">
+              🔒 All entries are stored privately on your device
+            </Text>
+          </View>
+
+          {/* Recent Entries */}
+          {entries.length > 0 && (
+            <View className="gap-3">
+              <Text className="text-sm font-medium text-muted">RECENT ENTRIES</Text>
+              {entries.slice(0, 5).map((entry) => (
+                <View key={entry.id} className="bg-surface rounded-lg p-4 border border-border">
+                  <View className="flex-row items-center justify-between mb-2">
+                    <Text className="text-sm font-medium text-foreground">
+                      {new Date(entry.date).toLocaleDateString("en-US", {
+                        month: "short",
+                        day: "numeric",
+                        year: "numeric",
+                      })}
+                    </Text>
+                    {entry.mood && (
+                      <Text className="text-xl">
+                        {entry.mood === "happy" ? "😊" : entry.mood === "neutral" ? "😐" : "😔"}
+                      </Text>
+                    )}
+                  </View>
+                  <Text className="text-sm text-muted" numberOfLines={2}>
+                    {entry.notes}
+                  </Text>
+                </View>
+              ))}
+            </View>
+          )}
+
+          {entries.length === 0 && (
+            <View className="bg-surface rounded-lg p-6 border border-border items-center">
+              <Text className="text-sm text-muted text-center">
+                No entries yet. Start tracking your daily patterns to discover insights over time.
+              </Text>
+            </View>
+          )}
+        </View>
+      </ScrollView>
+    </ScreenContainer>
+  );
+}
